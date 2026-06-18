@@ -30,7 +30,7 @@ def send_to_traderspost(payload):
         return False
 
     r = requests.post(TRADERSPOST_WEBHOOK, json=payload, timeout=15)
-    print("TradersPost:", r.status_code, r.text[:300])
+    print("TradersPost:", r.status_code, r.text[:500])
     return r.status_code in [200, 201, 202]
 
 
@@ -53,11 +53,14 @@ def home():
 def webhook():
     data = request.get_json(force=True, silent=True) or {}
 
+    print("RAW WEBHOOK DATA:", json.dumps(data, ensure_ascii=False))
+
     ticker = str(data.get("ticker", "")).upper()
     action = str(data.get("action", "")).lower()
     score = float(data.get("score", data.get("alphaScore", 0)) or 0)
     quantity = data.get("quantity", 1)
     order_type = data.get("orderType", "market")
+    signal_price = data.get("signalPrice") or data.get("price") or data.get("close")
 
     if not ticker or action not in ["buy", "sell", "exit"]:
         return jsonify({"ok": False, "error": "Invalid signal", "data": data}), 400
@@ -93,6 +96,7 @@ def webhook():
             })
 
         positions[ticker]["score"] = score
+        positions[ticker]["entry_signal_price"] = signal_price
         positions[ticker]["updated_at"] = time.time()
         state["positions"] = positions
         save_state(state)
@@ -120,7 +124,7 @@ def webhook():
         if ok:
             positions[ticker] = {
                 "score": score,
-                "entry_signal_price": data.get("signalPrice"),
+                "entry_signal_price": signal_price,
                 "created_at": time.time()
             }
             state["positions"] = positions
@@ -131,6 +135,7 @@ def webhook():
             "decision": "buy_sent",
             "ticker": ticker,
             "score": score,
+            "signal_price": signal_price,
             "open_positions": len(positions)
         })
 
@@ -165,7 +170,7 @@ def webhook():
             positions.pop(weakest_ticker, None)
             positions[ticker] = {
                 "score": score,
-                "entry_signal_price": data.get("signalPrice"),
+                "entry_signal_price": signal_price,
                 "created_at": time.time()
             }
             state["positions"] = positions
@@ -177,7 +182,8 @@ def webhook():
             "sold": weakest_ticker,
             "sold_score": weakest_score,
             "bought": ticker,
-            "bought_score": score
+            "bought_score": score,
+            "signal_price": signal_price
         })
 
     return jsonify({
