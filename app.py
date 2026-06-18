@@ -3,6 +3,7 @@ import os
 import json
 import time
 import requests
+import threading
 
 app = Flask(__name__)
 
@@ -31,6 +32,16 @@ def send_to_traderspost(payload):
     r = requests.post(TRADERSPOST_WEBHOOK, json=payload, timeout=15)
     print("TradersPost:", r.status_code, r.text[:300])
     return r.status_code in [200, 201, 202]
+
+
+def start_scanner_background():
+    try:
+        from scanner import run_scanner
+        t = threading.Thread(target=run_scanner, daemon=True)
+        t.start()
+        print("Scanner background thread started")
+    except Exception as e:
+        print("Scanner failed to start:", e)
 
 
 @app.route("/", methods=["GET"])
@@ -67,11 +78,7 @@ def webhook():
         state["positions"] = positions
         save_state(state)
 
-        return jsonify({
-            "ok": ok,
-            "decision": "exit_sent",
-            "ticker": ticker
-        })
+        return jsonify({"ok": ok, "decision": "exit_sent", "ticker": ticker})
 
     if ticker in positions:
         old_score = float(positions[ticker].get("score", 0))
@@ -131,7 +138,6 @@ def webhook():
         positions.items(),
         key=lambda item: float(item[1].get("score", 0))
     )
-
     weakest_score = float(weakest_data.get("score", 0))
 
     if score > weakest_score:
@@ -193,6 +199,8 @@ def reset_positions():
     save_state({"positions": {}})
     return jsonify({"ok": True, "message": "positions reset"})
 
+
+start_scanner_background()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
