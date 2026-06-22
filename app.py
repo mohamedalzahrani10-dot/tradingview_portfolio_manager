@@ -677,7 +677,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "Portfolio Manager Running ✅",
-        "version": "V2.1 Dynamic Sizing + Session Guard + Fee Guard",
+        "version": "V2.2 State Sync + Partial Exits",
         "session": get_session_info(),
         "max_positions": MAX_POSITIONS,
         "dynamic_position_sizing": USE_DYNAMIC_POSITION_SIZING,
@@ -1117,7 +1117,7 @@ def settings():
     available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions)
 
     return jsonify({
-        "VERSION": "V2.1 Dynamic Sizing + Session Guard + Fee Guard",
+        "VERSION": "V2.2 State Sync + Partial Exits",
         "MAX_POSITIONS": MAX_POSITIONS,
         "AVAILABLE_CASH": AVAILABLE_CASH,
         "RESERVED_CASH": round(reserved_cash, 2),
