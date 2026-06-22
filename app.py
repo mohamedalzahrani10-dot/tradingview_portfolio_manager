@@ -13,6 +13,12 @@ app = Flask(__name__)
 TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK", "")
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
 STATE_FILE = os.getenv("STATE_FILE", "portfolio_state.json")
+# إذا كنت تستخدم Railway Volume اجعلها مثلاً:
+# STATE_FILE=/data/portfolio_state.json
+ALLOW_ORPHAN_EXIT_WITH_SIGNAL_QUANTITY = os.getenv("ALLOW_ORPHAN_EXIT_WITH_SIGNAL_QUANTITY", "true").lower() == "true"
+PARTIAL_SELL_MIN_FULL_EXIT_QTY = int(os.getenv("PARTIAL_SELL_MIN_FULL_EXIT_QTY", "4"))
+PARTIAL_TAKE_PROFIT_PERCENT = float(os.getenv("PARTIAL_TAKE_PROFIT_PERCENT", "0.30"))
+SCALE_OUT_PERCENT = float(os.getenv("SCALE_OUT_PERCENT", "0.20"))
 
 # =========================================================
 # PORTFOLIO MANAGER V2.1
@@ -165,8 +171,15 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    # مهم على Railway: إذا استخدمت Volume مثل /data، ننشئ المجلد تلقائياً.
+    parent = os.path.dirname(os.path.abspath(STATE_FILE))
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+
+    tmp_file = STATE_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_file, STATE_FILE)
 
 
 def add_history(state, event, details=None):
@@ -515,6 +528,60 @@ def build_sell_payload(ticker, quantity):
     }
 
 
+def get_exit_reason(data):
+    extras = get_extras(data)
+    return str(extras.get("reason") or data.get("reason") or "tradingview_exit").lower().strip()
+
+
+def calculate_exit_quantity(position, incoming_quantity, reason):
+    """
+    يحول أوامر TradingView إلى كمية بيع مناسبة حسب الكمية الحقيقية في Railway.
+    - partial_take_profit: بيع 30%
+    - scale_out: بيع 20%
+    - dynamic_exit / session_clearance / exit: بيع كامل
+    إذا الكمية صغيرة أقل من PARTIAL_SELL_MIN_FULL_EXIT_QTY نحول البيع الجزئي إلى خروج كامل
+    لأن الأسهم لا تقبل كسوراً في هذا المسار غالباً.
+    """
+    local_qty = safe_int((position or {}).get("quantity", 0), 0)
+    source_qty = local_qty if local_qty > 0 else safe_int(incoming_quantity, 0)
+    if source_qty <= 0:
+        return 0, {"reason": reason, "mode": "no_quantity"}
+
+    partial_reasons = ["partial_take_profit", "short_partial_take_profit"]
+    scale_reasons = ["scale_out", "short_scale_out"]
+
+    if reason in partial_reasons:
+        if source_qty < PARTIAL_SELL_MIN_FULL_EXIT_QTY:
+            return source_qty, {"reason": reason, "mode": "partial_converted_to_full_exit_small_qty", "source_qty": source_qty}
+        qty = max(1, int(math.floor(source_qty * PARTIAL_TAKE_PROFIT_PERCENT)))
+        return min(qty, source_qty), {"reason": reason, "mode": "partial_take_profit", "percent": PARTIAL_TAKE_PROFIT_PERCENT, "source_qty": source_qty}
+
+    if reason in scale_reasons:
+        if source_qty < PARTIAL_SELL_MIN_FULL_EXIT_QTY:
+            return source_qty, {"reason": reason, "mode": "scale_converted_to_full_exit_small_qty", "source_qty": source_qty}
+        qty = max(1, int(math.floor(source_qty * SCALE_OUT_PERCENT)))
+        return min(qty, source_qty), {"reason": reason, "mode": "scale_out", "percent": SCALE_OUT_PERCENT, "source_qty": source_qty}
+
+    return source_qty, {"reason": reason, "mode": "full_exit", "source_qty": source_qty}
+
+
+def update_position_after_sell(positions, ticker, sold_quantity):
+    if ticker not in positions:
+        return positions, 0
+
+    current_qty = safe_int(positions[ticker].get("quantity", 0), 0)
+    remaining_qty = max(current_qty - safe_int(sold_quantity, 0), 0)
+
+    if remaining_qty <= 0:
+        positions.pop(ticker, None)
+    else:
+        positions[ticker]["quantity"] = remaining_qty
+        positions[ticker]["updated_at"] = time.time()
+        positions[ticker]["last_partial_exit_at"] = time.time()
+
+    return positions, remaining_qty
+
+
 def should_force_close_now():
     if not SESSION_RISK_MANAGER_ENABLED or not FORCE_CLOSE_BEFORE_SESSION_END:
         return False, "disabled"
@@ -640,9 +707,15 @@ def webhook():
     state = load_state()
     positions = state.get("positions", {})
 
-    # SELL / EXIT: الخروج مسموح إذا المركز محفوظ، وبكمية Railway الحقيقية.
+    # SELL / EXIT:
+    # إذا المركز محفوظ نخرج/نخفف حسب كمية Railway الحقيقية.
+    # إذا المركز غير محفوظ بسبب restart/reset نسمح بخروج orphan باستخدام كمية TradingView
+    # حتى لا تبقى مراكز معلقة في IBKR بلا إدارة.
     if action in ["sell", "exit"]:
-        if ticker not in positions:
+        reason = get_exit_reason(data)
+        local_position = positions.get(ticker)
+
+        if not local_position and not ALLOW_ORPHAN_EXIT_WITH_SIGNAL_QUANTITY:
             return jsonify({
                 "ok": True,
                 "decision": "ignored_exit_no_local_position",
@@ -650,27 +723,45 @@ def webhook():
                 "reason": "No local position found in portfolio_state"
             })
 
-        exit_quantity = safe_int(positions.get(ticker, {}).get("quantity", quantity), quantity)
-        payload = build_sell_payload(ticker, exit_quantity)
+        exit_quantity, exit_calc = calculate_exit_quantity(local_position, quantity, reason)
 
+        if exit_quantity <= 0:
+            return jsonify({
+                "ok": True,
+                "decision": "ignored_exit_zero_quantity",
+                "ticker": ticker,
+                "reason": reason,
+                "exit_calc": exit_calc
+            })
+
+        payload = build_sell_payload(ticker, exit_quantity)
         ok = send_to_traderspost(payload)
 
         if ok:
+            if local_position:
+                positions, remaining_qty = update_position_after_sell(positions, ticker, exit_quantity)
+            else:
+                remaining_qty = "unknown_orphan_position"
+
             add_history(state, "EXIT_SENT", {
                 "ticker": ticker,
                 "quantity": exit_quantity,
-                "reason": get_extras(data).get("reason", "tradingview_exit"),
-                "source_action": action
+                "remaining_quantity": remaining_qty,
+                "reason": reason,
+                "source_action": action,
+                "orphan_exit": not bool(local_position),
+                "exit_calc": exit_calc
             })
-            positions.pop(ticker, None)
             state["positions"] = positions
             save_state(state)
 
         return jsonify({
             "ok": ok,
-            "decision": "exit_sent",
+            "decision": "exit_sent" if local_position else "orphan_exit_sent_with_signal_quantity",
             "ticker": ticker,
-            "quantity": exit_quantity
+            "quantity": exit_quantity,
+            "reason": reason,
+            "exit_calc": exit_calc
         })
 
     # BUY final guard: يحترم سكربت TradingView.
@@ -917,6 +1008,108 @@ def force_close_route():
     return jsonify(result)
 
 
+
+@app.route("/history", methods=["GET"])
+def history():
+    state = load_state()
+    return jsonify({
+        "history": state.get("history", []),
+        "positions": state.get("positions", {}),
+        "closed_sessions": state.get("closed_sessions", {}),
+        "state_file": STATE_FILE,
+        "state_file_exists": os.path.exists(STATE_FILE),
+    })
+
+
+@app.route("/manual_position", methods=["POST"])
+def manual_position():
+    """
+    إضافة مركز موجود فعلياً في IBKR إلى ذاكرة Railway.
+    مثال PowerShell:
+    Invoke-RestMethod -Uri "https://.../manual_position" -Method POST -ContentType "application/json" -Body '{"ticker":"STZ","quantity":2,"entry_price":141.89,"score":90}'
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    ticker = str(data.get("ticker", "")).upper().strip()
+    quantity = safe_int(data.get("quantity"), 0)
+
+    if not ticker or quantity <= 0:
+        return jsonify({"ok": False, "error": "ticker and positive quantity are required", "data": data}), 400
+
+    state = load_state()
+    positions = state.setdefault("positions", {})
+
+    entry_price = safe_float(data.get("entry_price") or data.get("entryPrice") or data.get("price"), 0)
+    score = safe_float(data.get("score"), 0)
+
+    positions[ticker] = {
+        "score": score,
+        "alpha_score": safe_float(data.get("alphaScore"), 0),
+        "quantity": quantity,
+        "entry_signal_price": entry_price,
+        "entry_price": entry_price,
+        "take_profit_price": safe_float(data.get("takeProfitPrice"), 0),
+        "order_type": "manual_sync",
+        "limit_price": entry_price,
+        "session": get_session_info()["session"],
+        "sizing": {"mode": "manual_position_sync"},
+        "fee_guard": {"mode": "manual_position_sync"},
+        "session_meta": {"mode": "manual_position_sync"},
+        "created_at": time.time(),
+        "manual_sync": True,
+        "last_signal": data
+    }
+
+    add_history(state, "MANUAL_POSITION_SYNC", {"ticker": ticker, "quantity": quantity, "entry_price": entry_price})
+    save_state(state)
+
+    return jsonify({"ok": True, "decision": "manual_position_synced", "ticker": ticker, "quantity": quantity, "positions": positions})
+
+
+@app.route("/remove_position", methods=["POST"])
+def remove_position():
+    data = request.get_json(force=True, silent=True) or {}
+    ticker = str(data.get("ticker", "")).upper().strip()
+
+    if not ticker:
+        return jsonify({"ok": False, "error": "ticker is required"}), 400
+
+    state = load_state()
+    existed = ticker in state.get("positions", {})
+    state.setdefault("positions", {}).pop(ticker, None)
+    add_history(state, "MANUAL_POSITION_REMOVED", {"ticker": ticker, "existed": existed})
+    save_state(state)
+
+    return jsonify({"ok": True, "ticker": ticker, "removed": existed})
+
+
+@app.route("/force_close/<ticker>", methods=["POST", "GET"])
+def force_close_one_route(ticker):
+    ticker = str(ticker).upper().strip()
+    state = load_state()
+    positions = state.get("positions", {})
+
+    if ticker not in positions:
+        return jsonify({
+            "ok": False,
+            "error": "ticker not found in local positions",
+            "ticker": ticker,
+            "hint": "Use /manual_position first if this position exists in IBKR but not in Railway."
+        }), 404
+
+    qty = safe_int(positions[ticker].get("quantity", 0), 0)
+    if qty <= 0:
+        return jsonify({"ok": False, "error": "invalid local quantity", "ticker": ticker}), 400
+
+    payload = build_sell_payload(ticker, qty)
+    ok = send_to_traderspost(payload)
+
+    if ok:
+        positions.pop(ticker, None)
+        state["positions"] = positions
+        add_history(state, "MANUAL_FORCE_CLOSE_ONE", {"ticker": ticker, "quantity": qty})
+        save_state(state)
+
+    return jsonify({"ok": ok, "ticker": ticker, "quantity": qty, "decision": "force_close_one_sent"})
 @app.route("/settings", methods=["GET"])
 def settings():
     state = load_state()
@@ -948,6 +1141,13 @@ def settings():
         "IBKR_FEE_PER_SHARE": IBKR_FEE_PER_SHARE,
         "IBKR_MIN_FEE_PER_ORDER": IBKR_MIN_FEE_PER_ORDER,
         "MIN_PROFIT_FEE_MULTIPLIER": MIN_PROFIT_FEE_MULTIPLIER,
+        "ALLOW_ORPHAN_EXIT_WITH_SIGNAL_QUANTITY": ALLOW_ORPHAN_EXIT_WITH_SIGNAL_QUANTITY,
+        "PARTIAL_SELL_MIN_FULL_EXIT_QTY": PARTIAL_SELL_MIN_FULL_EXIT_QTY,
+        "PARTIAL_TAKE_PROFIT_PERCENT": PARTIAL_TAKE_PROFIT_PERCENT,
+        "SCALE_OUT_PERCENT": SCALE_OUT_PERCENT,
+        "STATE_FILE": STATE_FILE,
+        "STATE_FILE_EXISTS": os.path.exists(STATE_FILE),
+        "WORKING_DIRECTORY": os.getcwd(),
         "SESSION": get_session_info(),
     })
 
