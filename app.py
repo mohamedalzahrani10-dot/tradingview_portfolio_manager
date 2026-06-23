@@ -405,24 +405,18 @@ def calculate_dynamic_quantity(data, positions, state=None):
 
     max_affordable_quantity = int(math.floor(usable_cash / price))
 
-    # V2.2 FIX:
-    # In dynamic sizing mode, Portfolio Manager must calculate the order size
-    # from usable cash. If TradingView does not send quantity, safe_int() used
-    # to default original_quantity to 1, which caused small orders like PCG
-    # to be blocked by MIN_TRADE_VALUE even when cash could buy more shares.
-    #
-    # Behavior:
-    # - If TradingView sends an explicit positive quantity, respect it as an upper cap.
-    # - If no quantity is sent, use the maximum affordable dynamic quantity.
+    # V2.5 SAFETY FIX:
+    # Portfolio Manager must be the only authority for BUY sizing.
+    # TradingView may send a large "quantity" based on strategy equity/backtest logic.
+    # For BUY orders we intentionally ignore TradingView quantity completely and
+    # calculate the order size only from available cash, reserved cash, cash usage,
+    # and safety buffer. SELL/EXIT quantity handling remains unchanged elsewhere.
     raw_quantity = data.get("quantity")
-    has_explicit_quantity = raw_quantity not in [None, "", "None"]
+    tradingview_quantity_ignored = raw_quantity not in [None, "", "None"]
 
-    if has_explicit_quantity:
-        final_quantity = min(original_quantity, max_affordable_quantity)
-        sizing_quantity_mode = "dynamic_capped_by_tradingview_quantity"
-    else:
-        final_quantity = max_affordable_quantity
-        sizing_quantity_mode = "dynamic_cash_based_quantity"
+    final_quantity = max_affordable_quantity
+    has_explicit_quantity = False
+    sizing_quantity_mode = "portfolio_manager_dynamic_cash_only"
 
     trade_value = final_quantity * price
 
@@ -438,6 +432,7 @@ def calculate_dynamic_quantity(data, positions, state=None):
             "price_used": price,
             "original_quantity": original_quantity,
             "has_explicit_quantity": has_explicit_quantity,
+            "tradingview_quantity_ignored": tradingview_quantity_ignored,
             "quantity_mode": sizing_quantity_mode,
             "max_affordable_quantity": max_affordable_quantity
         }
@@ -455,6 +450,7 @@ def calculate_dynamic_quantity(data, positions, state=None):
             "quantity": final_quantity,
             "original_quantity": original_quantity,
             "has_explicit_quantity": has_explicit_quantity,
+            "tradingview_quantity_ignored": tradingview_quantity_ignored,
             "quantity_mode": sizing_quantity_mode,
             "max_affordable_quantity": max_affordable_quantity,
             "trade_value": round(trade_value, 2),
@@ -474,6 +470,7 @@ def calculate_dynamic_quantity(data, positions, state=None):
         "price_used": price,
         "original_quantity": original_quantity,
         "has_explicit_quantity": has_explicit_quantity,
+        "tradingview_quantity_ignored": tradingview_quantity_ignored,
         "quantity_mode": sizing_quantity_mode,
         "max_affordable_quantity": max_affordable_quantity,
         "final_quantity": final_quantity,
@@ -856,7 +853,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "Portfolio Manager Running ✅",
-        "version": "V2.4 Auto SL/TP + Internal Cash Sync",
+        "version": "V2.5 Cash-Only BUY Sizing + Auto SL/TP",
         "session": get_session_info(),
         "max_positions": MAX_POSITIONS,
         "dynamic_position_sizing": USE_DYNAMIC_POSITION_SIZING,
@@ -1417,7 +1414,7 @@ def settings():
     available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions, state)
 
     return jsonify({
-        "VERSION": "V2.4 Auto SL/TP + Internal Cash Sync",
+        "VERSION": "V2.5 Cash-Only BUY Sizing + Auto SL/TP",
         "MAX_POSITIONS": MAX_POSITIONS,
         "AVAILABLE_CASH": get_effective_available_cash(state),
         "ENV_AVAILABLE_CASH": AVAILABLE_CASH,
