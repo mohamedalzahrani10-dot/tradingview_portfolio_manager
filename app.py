@@ -20,6 +20,14 @@ PARTIAL_SELL_MIN_FULL_EXIT_QTY = int(os.getenv("PARTIAL_SELL_MIN_FULL_EXIT_QTY",
 PARTIAL_TAKE_PROFIT_PERCENT = float(os.getenv("PARTIAL_TAKE_PROFIT_PERCENT", "0.30"))
 SCALE_OUT_PERCENT = float(os.getenv("SCALE_OUT_PERCENT", "0.20"))
 
+# V2.6 Pending Orders + Production Safety
+ALLOW_TEST_TICKERS = os.getenv("ALLOW_TEST_TICKERS", "false").lower() == "true"
+TEST_TICKER_PREFIXES = tuple(
+    x.strip().upper()
+    for x in os.getenv("TEST_TICKER_PREFIXES", "TEST").split(",")
+    if x.strip()
+)
+
 # V2.4 Auto Exit Manager
 AUTO_EXIT_MANAGER_ENABLED = os.getenv("AUTO_EXIT_MANAGER_ENABLED", "true").lower() == "true"
 AUTO_EXIT_FULL_ON_STOP_LOSS = os.getenv("AUTO_EXIT_FULL_ON_STOP_LOSS", "true").lower() == "true"
@@ -101,6 +109,11 @@ def safe_int(value, default=1):
         return default
 
 
+def is_test_ticker(ticker):
+    ticker = str(ticker or "").upper().strip()
+    return bool(ticker) and any(ticker.startswith(prefix) for prefix in TEST_TICKER_PREFIXES)
+
+
 def parse_hhmm(value, fallback="00:00"):
     try:
         h, m = str(value).split(":")
@@ -164,7 +177,7 @@ def get_session_info():
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"positions": {}, "closed_sessions": {}, "history": []}
+        return {"positions": {}, "pending_orders": {}, "closed_sessions": {}, "history": []}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
@@ -172,6 +185,7 @@ def load_state():
         state = {}
 
     state.setdefault("positions", {})
+    state.setdefault("pending_orders", {})
     state.setdefault("closed_sessions", {})
     state.setdefault("history", [])
     return state
@@ -314,11 +328,17 @@ def get_position_reserved_value(position):
     return max(qty * price, 0)
 
 
-def get_reserved_cash(positions):
+def get_reserved_cash(positions, pending_orders=None):
     total = 0.0
     for _, pos in (positions or {}).items():
         if isinstance(pos, dict):
             total += get_position_reserved_value(pos)
+
+    # Pending limit orders reserve cash too because IBKR may fill them later.
+    for _, order in (pending_orders or {}).items():
+        if isinstance(order, dict):
+            total += get_position_reserved_value(order)
+
     return total
 
 
@@ -346,7 +366,10 @@ def get_effective_available_cash(state=None):
 
 def get_available_cash_after_reserved(positions, state=None):
     base_cash = get_effective_available_cash(state)
-    reserved = get_reserved_cash(positions)
+    pending_orders = {}
+    if isinstance(state, dict):
+        pending_orders = state.get("pending_orders", {})
+    reserved = get_reserved_cash(positions, pending_orders)
     remaining = max(base_cash - reserved, 0)
     return remaining, reserved
 
@@ -385,8 +408,11 @@ def calculate_dynamic_quantity(data, positions, state=None):
             "price_used": price
         }
 
+    pending_orders = state.get("pending_orders", {}) if isinstance(state, dict) else {}
     open_positions = len(positions)
-    remaining_slots = max(MAX_POSITIONS - open_positions, 0)
+    pending_count = len(pending_orders)
+    occupied_slots = open_positions + pending_count
+    remaining_slots = max(MAX_POSITIONS - occupied_slots, 0)
 
     if remaining_slots <= 0:
         return 0, {
@@ -396,6 +422,8 @@ def calculate_dynamic_quantity(data, positions, state=None):
             "available_cash": effective_available_cash,
             "reserved_cash": round(reserved_cash, 2),
             "open_positions": open_positions,
+            "pending_orders": pending_count,
+            "occupied_slots": occupied_slots,
             "max_positions": MAX_POSITIONS,
             "price_used": price
         }
@@ -466,6 +494,8 @@ def calculate_dynamic_quantity(data, positions, state=None):
         "cash_usage_percent": CASH_USAGE_PERCENT,
         "safety_buffer_percent": SAFETY_BUFFER_PERCENT,
         "open_positions": open_positions,
+        "pending_orders": pending_count,
+        "occupied_slots": occupied_slots,
         "remaining_slots": remaining_slots,
         "price_used": price,
         "original_quantity": original_quantity,
@@ -678,6 +708,7 @@ def should_force_close_now():
 def force_close_positions(reason="session_force_close"):
     state = load_state()
     positions = state.get("positions", {})
+    pending_orders = state.get("pending_orders", {})
     if not positions:
         return {"ok": True, "closed": 0, "reason": "no_positions"}
 
@@ -853,7 +884,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "Portfolio Manager Running ✅",
-        "version": "V2.5 Cash-Only BUY Sizing + Auto SL/TP",
+        "version": "V2.6 Pending Orders + Cash-Only Sizing",
         "session": get_session_info(),
         "max_positions": MAX_POSITIONS,
         "dynamic_position_sizing": USE_DYNAMIC_POSITION_SIZING,
@@ -880,6 +911,14 @@ def webhook():
 
     if not ticker or action not in ["buy", "sell", "exit", "price_update", "monitor"]:
         return jsonify({"ok": False, "error": "Invalid signal", "data": data}), 400
+
+    if action == "buy" and is_test_ticker(ticker) and not ALLOW_TEST_TICKERS:
+        return jsonify({
+            "ok": True,
+            "decision": "blocked_test_ticker",
+            "ticker": ticker,
+            "reason": "Test tickers are blocked in production. Use a real ticker for live tests or set ALLOW_TEST_TICKERS=true."
+        })
 
     state = load_state()
     positions = state.get("positions", {})
@@ -978,6 +1017,32 @@ def webhook():
             "session_meta": session_meta
         })
 
+    if ticker in pending_orders:
+        old_score = safe_float(pending_orders[ticker].get("score", 0), 0)
+        if score <= old_score:
+            return jsonify({
+                "ok": True,
+                "decision": "ignored_duplicate_pending_order_lower_score",
+                "ticker": ticker,
+                "old_score": old_score,
+                "new_score": score
+            })
+
+        pending_orders[ticker]["score"] = score
+        pending_orders[ticker]["entry_signal_price"] = signal_price
+        pending_orders[ticker]["updated_at"] = time.time()
+        pending_orders[ticker]["last_signal"] = data
+        state["pending_orders"] = pending_orders
+        add_history(state, "UPDATED_PENDING_ORDER_SCORE", {"ticker": ticker, "score": score})
+        save_state(state)
+
+        return jsonify({
+            "ok": True,
+            "decision": "updated_pending_order_score",
+            "ticker": ticker,
+            "score": score
+        })
+
     if ticker in positions:
         old_score = safe_float(positions[ticker].get("score", 0), 0)
 
@@ -1032,12 +1097,13 @@ def webhook():
             "sizing": sizing_info
         })
 
-    if len(positions) < MAX_POSITIONS:
+    occupied_slots = len(positions) + len(pending_orders)
+    if occupied_slots < MAX_POSITIONS:
         payload = build_buy_payload(data, ticker, final_quantity, order_type)
         ok = send_to_traderspost(payload)
 
         if ok:
-            positions[ticker] = {
+            order_record = {
                 "score": score,
                 "alpha_score": safe_float(data.get("alphaScore"), 0),
                 "quantity": final_quantity,
@@ -1054,21 +1120,46 @@ def webhook():
                 "created_at": time.time(),
                 "last_signal": data
             }
-            state["positions"] = positions
-            add_history(state, "BUY_SENT", {
-                "ticker": ticker,
-                "quantity": final_quantity,
-                "score": score,
-                "sizing": sizing_info,
-                "fee_guard": fee_info,
-                "session_meta": session_meta
-            })
-            print(f"POSITION SAVED: {ticker} qty={final_quantity}", flush=True)
+
+            if order_type == "limit":
+                # Critical V2.6 fix:
+                # A submitted limit order is NOT a filled position. Keep it as pending
+                # so Railway does not assume ownership of shares before IBKR fills them.
+                pending_orders[ticker] = order_record
+                state["pending_orders"] = pending_orders
+                add_history(state, "BUY_ORDER_SUBMITTED_PENDING", {
+                    "ticker": ticker,
+                    "quantity": final_quantity,
+                    "score": score,
+                    "sizing": sizing_info,
+                    "fee_guard": fee_info,
+                    "session_meta": session_meta
+                })
+                print(f"PENDING ORDER SAVED: {ticker} qty={final_quantity}", flush=True)
+                decision = "buy_order_submitted_pending"
+            else:
+                # Market orders are treated as positions after successful submission.
+                # For stricter production, connect a broker fill callback in a later version.
+                positions[ticker] = order_record
+                state["positions"] = positions
+                add_history(state, "BUY_SENT", {
+                    "ticker": ticker,
+                    "quantity": final_quantity,
+                    "score": score,
+                    "sizing": sizing_info,
+                    "fee_guard": fee_info,
+                    "session_meta": session_meta
+                })
+                print(f"POSITION SAVED: {ticker} qty={final_quantity}", flush=True)
+                decision = "buy_sent"
+
             save_state(state)
+        else:
+            decision = "buy_failed"
 
         return jsonify({
             "ok": ok,
-            "decision": "buy_sent",
+            "decision": decision,
             "ticker": ticker,
             "score": score,
             "signal_price": signal_price,
@@ -1076,7 +1167,18 @@ def webhook():
             "sizing": sizing_info,
             "fee_guard": fee_info,
             "session_meta": session_meta,
-            "open_positions": len(positions)
+            "open_positions": len(positions),
+            "pending_orders": len(pending_orders)
+        })
+
+    if not positions:
+        return jsonify({
+            "ok": True,
+            "decision": "ignored_max_positions_reached_due_to_pending_orders",
+            "ticker": ticker,
+            "score": score,
+            "pending_orders": len(pending_orders),
+            "max_positions": MAX_POSITIONS
         })
 
     weakest_ticker, weakest_data = min(
@@ -1189,8 +1291,20 @@ def get_positions():
 
 @app.route("/reset", methods=["POST"])
 def reset_positions():
-    save_state({"positions": {}, "closed_sessions": {}, "history": []})
-    return jsonify({"ok": True, "message": "positions reset"})
+    save_state({"positions": {}, "pending_orders": {}, "closed_sessions": {}, "history": []})
+    return jsonify({"ok": True, "message": "positions and pending orders reset"})
+
+
+@app.route("/hard_reset", methods=["POST", "GET"])
+def hard_reset_positions():
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "state_file": STATE_FILE}), 500
+
+    save_state({"positions": {}, "pending_orders": {}, "closed_sessions": {}, "history": []})
+    return jsonify({"ok": True, "message": "state file deleted and recreated", "state_file": STATE_FILE})
 
 
 @app.route("/force_close", methods=["POST", "GET"])
@@ -1206,6 +1320,7 @@ def history():
     return jsonify({
         "history": state.get("history", []),
         "positions": state.get("positions", {}),
+        "pending_orders": state.get("pending_orders", {}),
         "closed_sessions": state.get("closed_sessions", {}),
         "state_file": STATE_FILE,
         "state_file_exists": os.path.exists(STATE_FILE),
@@ -1266,12 +1381,23 @@ def remove_position():
         return jsonify({"ok": False, "error": "ticker is required"}), 400
 
     state = load_state()
-    existed = ticker in state.get("positions", {})
+    existed_position = ticker in state.get("positions", {})
+    existed_pending = ticker in state.get("pending_orders", {})
     state.setdefault("positions", {}).pop(ticker, None)
-    add_history(state, "MANUAL_POSITION_REMOVED", {"ticker": ticker, "existed": existed})
+    state.setdefault("pending_orders", {}).pop(ticker, None)
+    add_history(state, "MANUAL_POSITION_REMOVED", {
+        "ticker": ticker,
+        "existed_position": existed_position,
+        "existed_pending_order": existed_pending
+    })
     save_state(state)
 
-    return jsonify({"ok": True, "ticker": ticker, "removed": existed})
+    return jsonify({
+        "ok": True,
+        "ticker": ticker,
+        "removed_position": existed_position,
+        "removed_pending_order": existed_pending
+    })
 
 
 @app.route("/force_close/<ticker>", methods=["POST", "GET"])
@@ -1302,6 +1428,60 @@ def force_close_one_route(ticker):
         save_state(state)
 
     return jsonify({"ok": ok, "ticker": ticker, "quantity": qty, "decision": "force_close_one_sent"})
+@app.route("/mark_filled", methods=["POST"])
+def mark_filled():
+    """
+    Moves a submitted pending order into positions after you verify it filled in IBKR/TradersPost.
+
+    PowerShell:
+    Invoke-RestMethod -Uri "https://.../mark_filled" -Method POST -ContentType "application/json" -Body '{"ticker":"F"}'
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    ticker = str(data.get("ticker", "")).upper().strip()
+
+    if not ticker:
+        return jsonify({"ok": False, "error": "ticker is required"}), 400
+
+    state = load_state()
+    pending_orders = state.setdefault("pending_orders", {})
+    positions = state.setdefault("positions", {})
+
+    if ticker not in pending_orders:
+        return jsonify({
+            "ok": False,
+            "error": "ticker not found in pending_orders",
+            "ticker": ticker,
+            "pending_orders": list(pending_orders.keys())
+        }), 404
+
+    order = pending_orders.pop(ticker)
+    if data.get("quantity") not in [None, "", "None"]:
+        order["quantity"] = safe_int(data.get("quantity"), order.get("quantity", 1))
+    if data.get("fill_price") not in [None, "", "None"]:
+        order["entry_price"] = safe_float(data.get("fill_price"), order.get("entry_price", 0))
+
+    order["filled_at"] = time.time()
+    order["order_status"] = "filled_manual_confirm"
+    positions[ticker] = order
+
+    state["pending_orders"] = pending_orders
+    state["positions"] = positions
+    add_history(state, "PENDING_ORDER_MARKED_FILLED", {
+        "ticker": ticker,
+        "quantity": order.get("quantity"),
+        "entry_price": order.get("entry_price")
+    })
+    save_state(state)
+
+    return jsonify({
+        "ok": True,
+        "decision": "pending_order_marked_filled",
+        "ticker": ticker,
+        "positions": positions,
+        "pending_orders": pending_orders
+    })
+
+
 @app.route("/update_cash", methods=["POST"])
 def update_cash():
     """
@@ -1379,7 +1559,9 @@ def cash_status():
         "safety_buffer_percent": SAFETY_BUFFER_PERCENT,
         "usable_cash_after_buffer": round(available_after_reserved * CASH_USAGE_PERCENT * (1 - SAFETY_BUFFER_PERCENT), 2),
         "open_positions": len(positions),
-        "positions": positions
+        "pending_orders_count": len(state.get("pending_orders", {})),
+        "positions": positions,
+        "pending_orders": state.get("pending_orders", {})
     })
 
 
@@ -1414,7 +1596,7 @@ def settings():
     available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions, state)
 
     return jsonify({
-        "VERSION": "V2.5 Cash-Only BUY Sizing + Auto SL/TP",
+        "VERSION": "V2.6 Pending Orders + Cash-Only Sizing",
         "MAX_POSITIONS": MAX_POSITIONS,
         "AVAILABLE_CASH": get_effective_available_cash(state),
         "ENV_AVAILABLE_CASH": AVAILABLE_CASH,
@@ -1422,6 +1604,8 @@ def settings():
         "CASH_UPDATED_AT": state.get("cash", {}).get("updated_at") if isinstance(state.get("cash", {}), dict) else None,
         "RESERVED_CASH": round(reserved_cash, 2),
         "AVAILABLE_AFTER_RESERVED": round(available_after_reserved, 2),
+        "PENDING_ORDERS_COUNT": len(state.get("pending_orders", {})),
+        "OPEN_POSITIONS_COUNT": len(positions),
         "CASH_USAGE_PERCENT": CASH_USAGE_PERCENT,
         "SAFETY_BUFFER_PERCENT": SAFETY_BUFFER_PERCENT,
         "MIN_TRADE_VALUE": MIN_TRADE_VALUE,
@@ -1445,6 +1629,8 @@ def settings():
         "PARTIAL_SELL_MIN_FULL_EXIT_QTY": PARTIAL_SELL_MIN_FULL_EXIT_QTY,
         "PARTIAL_TAKE_PROFIT_PERCENT": PARTIAL_TAKE_PROFIT_PERCENT,
         "SCALE_OUT_PERCENT": SCALE_OUT_PERCENT,
+        "ALLOW_TEST_TICKERS": ALLOW_TEST_TICKERS,
+        "TEST_TICKER_PREFIXES": list(TEST_TICKER_PREFIXES),
         "AUTO_EXIT_MANAGER_ENABLED": AUTO_EXIT_MANAGER_ENABLED,
         "AUTO_EXIT_FULL_ON_STOP_LOSS": AUTO_EXIT_FULL_ON_STOP_LOSS,
         "AUTO_EXIT_FULL_ON_TAKE_PROFIT": AUTO_EXIT_FULL_ON_TAKE_PROFIT,
