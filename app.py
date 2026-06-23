@@ -294,8 +294,30 @@ def get_reserved_cash(positions):
     return total
 
 
-def get_available_cash_after_reserved(positions):
-    base_cash = AVAILABLE_CASH
+def get_effective_available_cash(state=None):
+    """
+    Returns the cash value Portfolio Manager should use for sizing.
+
+    Priority:
+    1) Runtime/persisted cash saved by /update_cash in portfolio_state.json
+    2) Railway AVAILABLE_CASH environment variable
+
+    This lets you update cash without changing Railway variables or redeploying.
+    """
+    try:
+        if state is None:
+            state = load_state()
+        cash_state = state.get("cash", {}) if isinstance(state, dict) else {}
+        synced_cash = safe_float(cash_state.get("available_cash"), -1)
+        if synced_cash >= 0:
+            return synced_cash
+    except Exception:
+        pass
+    return AVAILABLE_CASH
+
+
+def get_available_cash_after_reserved(positions, state=None):
+    base_cash = get_effective_available_cash(state)
     reserved = get_reserved_cash(positions)
     remaining = max(base_cash - reserved, 0)
     return remaining, reserved
@@ -304,6 +326,7 @@ def get_available_cash_after_reserved(positions):
 def calculate_dynamic_quantity(data, positions):
     original_quantity = safe_int(data.get("quantity", 1), 1)
     price = get_trade_price(data)
+    effective_available_cash = get_effective_available_cash()
 
     if not USE_DYNAMIC_POSITION_SIZING:
         return original_quantity, {
@@ -312,14 +335,14 @@ def calculate_dynamic_quantity(data, positions):
             "quantity": original_quantity
         }
 
-    available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions)
+    available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions, state)
 
-    if AVAILABLE_CASH <= 0:
+    if effective_available_cash <= 0:
         return 0, {
             "mode": "dynamic_position_sizing_v2_1",
             "blocked": True,
             "reason": "AVAILABLE_CASH is not configured or <= 0",
-            "available_cash": AVAILABLE_CASH,
+            "available_cash": effective_available_cash,
             "price_used": price
         }
 
@@ -328,7 +351,7 @@ def calculate_dynamic_quantity(data, positions):
             "mode": "dynamic_position_sizing_v2_1",
             "blocked": True,
             "reason": "Missing valid price for sizing",
-            "available_cash": AVAILABLE_CASH,
+            "available_cash": effective_available_cash,
             "reserved_cash": round(reserved_cash, 2),
             "available_after_reserved": round(available_after_reserved, 2),
             "price_used": price
@@ -342,7 +365,7 @@ def calculate_dynamic_quantity(data, positions):
             "mode": "dynamic_position_sizing_v2_1",
             "blocked": True,
             "reason": "MAX_POSITIONS reached",
-            "available_cash": AVAILABLE_CASH,
+            "available_cash": effective_available_cash,
             "reserved_cash": round(reserved_cash, 2),
             "open_positions": open_positions,
             "max_positions": MAX_POSITIONS,
@@ -380,7 +403,7 @@ def calculate_dynamic_quantity(data, positions):
             "mode": "dynamic_position_sizing_v2_1",
             "blocked": True,
             "reason": "Not enough cash to buy at least 1 share after reserved cash",
-            "available_cash": AVAILABLE_CASH,
+            "available_cash": effective_available_cash,
             "reserved_cash": round(reserved_cash, 2),
             "available_after_reserved": round(available_after_reserved, 2),
             "usable_cash": round(usable_cash, 2),
@@ -396,7 +419,7 @@ def calculate_dynamic_quantity(data, positions):
             "mode": "dynamic_position_sizing_v2_1",
             "blocked": True,
             "reason": "Trade value below MIN_TRADE_VALUE",
-            "available_cash": AVAILABLE_CASH,
+            "available_cash": effective_available_cash,
             "reserved_cash": round(reserved_cash, 2),
             "available_after_reserved": round(available_after_reserved, 2),
             "usable_cash": round(usable_cash, 2),
@@ -412,7 +435,7 @@ def calculate_dynamic_quantity(data, positions):
 
     return final_quantity, {
         "mode": "dynamic_position_sizing_v2_1",
-        "available_cash": AVAILABLE_CASH,
+        "available_cash": effective_available_cash,
         "reserved_cash": round(reserved_cash, 2),
         "available_after_reserved": round(available_after_reserved, 2),
         "usable_cash": round(usable_cash, 2),
@@ -704,12 +727,13 @@ def home():
     return jsonify({
         "ok": True,
         "service": "Portfolio Manager Running ✅",
-        "version": "V2.2 State Sync + Partial Exits",
+        "version": "V2.3 Internal Cash Sync + Partial Exits",
         "session": get_session_info(),
         "max_positions": MAX_POSITIONS,
         "dynamic_position_sizing": USE_DYNAMIC_POSITION_SIZING,
         "session_risk_manager": SESSION_RISK_MANAGER_ENABLED,
         "available_cash_setting": AVAILABLE_CASH,
+        "effective_available_cash": get_effective_available_cash(),
         "cash_usage_percent": CASH_USAGE_PERCENT,
         "safety_buffer_percent": SAFETY_BUFFER_PERCENT
     })
@@ -1139,16 +1163,100 @@ def force_close_one_route(ticker):
         save_state(state)
 
     return jsonify({"ok": ok, "ticker": ticker, "quantity": qty, "decision": "force_close_one_sent"})
+@app.route("/update_cash", methods=["POST"])
+def update_cash():
+    """
+    Updates the cash used by Portfolio Manager for dynamic sizing without Railway redeploy.
+
+    PowerShell example:
+    $body = @{ available_cash = 439.11; source = "traderspost_manual" } | ConvertTo-Json
+    Invoke-RestMethod `
+     -Uri "https://.../update_cash" `
+     -Method Post `
+     -ContentType "application/json" `
+     -Body $body
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    new_cash = safe_float(data.get("available_cash", data.get("cash")), -1)
+
+    if new_cash < 0:
+        return jsonify({
+            "ok": False,
+            "error": "available_cash must be provided and must be >= 0",
+            "data": data
+        }), 400
+
+    state = load_state()
+    state["cash"] = {
+        "available_cash": round(new_cash, 2),
+        "source": str(data.get("source", "manual_update")),
+        "updated_at": now_ts(),
+        "updated_at_ny": get_session_info().get("now_ny"),
+        "previous_env_available_cash": AVAILABLE_CASH
+    }
+
+    positions = state.get("positions", {})
+    available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions, state)
+
+    add_history(state, "CASH_UPDATED", {
+        "available_cash": round(new_cash, 2),
+        "reserved_cash": round(reserved_cash, 2),
+        "available_after_reserved": round(available_after_reserved, 2),
+        "source": state["cash"]["source"]
+    })
+    save_state(state)
+
+    return jsonify({
+        "ok": True,
+        "decision": "cash_updated",
+        "available_cash": round(new_cash, 2),
+        "reserved_cash": round(reserved_cash, 2),
+        "available_after_reserved": round(available_after_reserved, 2),
+        "cash_usage_percent": CASH_USAGE_PERCENT,
+        "safety_buffer_percent": SAFETY_BUFFER_PERCENT,
+        "usable_cash_after_buffer": round(available_after_reserved * CASH_USAGE_PERCENT * (1 - SAFETY_BUFFER_PERCENT), 2),
+        "positions_count": len(positions),
+        "cash_source": state["cash"]["source"]
+    })
+
+
+@app.route("/cash_status", methods=["GET"])
+def cash_status():
+    state = load_state()
+    positions = state.get("positions", {})
+    effective_cash = get_effective_available_cash(state)
+    available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions, state)
+
+    return jsonify({
+        "ok": True,
+        "available_cash": round(effective_cash, 2),
+        "env_available_cash": AVAILABLE_CASH,
+        "cash_source": state.get("cash", {}).get("source", "railway_env") if isinstance(state.get("cash", {}), dict) else "railway_env",
+        "cash_updated_at": state.get("cash", {}).get("updated_at") if isinstance(state.get("cash", {}), dict) else None,
+        "cash_updated_at_ny": state.get("cash", {}).get("updated_at_ny") if isinstance(state.get("cash", {}), dict) else None,
+        "reserved_cash": round(reserved_cash, 2),
+        "available_after_reserved": round(available_after_reserved, 2),
+        "cash_usage_percent": CASH_USAGE_PERCENT,
+        "safety_buffer_percent": SAFETY_BUFFER_PERCENT,
+        "usable_cash_after_buffer": round(available_after_reserved * CASH_USAGE_PERCENT * (1 - SAFETY_BUFFER_PERCENT), 2),
+        "open_positions": len(positions),
+        "positions": positions
+    })
+
+
 @app.route("/settings", methods=["GET"])
 def settings():
     state = load_state()
     positions = state.get("positions", {})
-    available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions)
+    available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions, state)
 
     return jsonify({
-        "VERSION": "V2.2 State Sync + Partial Exits",
+        "VERSION": "V2.3 Internal Cash Sync + Partial Exits",
         "MAX_POSITIONS": MAX_POSITIONS,
-        "AVAILABLE_CASH": AVAILABLE_CASH,
+        "AVAILABLE_CASH": get_effective_available_cash(state),
+        "ENV_AVAILABLE_CASH": AVAILABLE_CASH,
+        "CASH_SOURCE": state.get("cash", {}).get("source", "railway_env") if isinstance(state.get("cash", {}), dict) else "railway_env",
+        "CASH_UPDATED_AT": state.get("cash", {}).get("updated_at") if isinstance(state.get("cash", {}), dict) else None,
         "RESERVED_CASH": round(reserved_cash, 2),
         "AVAILABLE_AFTER_RESERVED": round(available_after_reserved, 2),
         "CASH_USAGE_PERCENT": CASH_USAGE_PERCENT,
