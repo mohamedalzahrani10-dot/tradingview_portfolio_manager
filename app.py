@@ -353,7 +353,26 @@ def calculate_dynamic_quantity(data, positions):
     usable_cash = usable_cash * (1 - SAFETY_BUFFER_PERCENT)
 
     max_affordable_quantity = int(math.floor(usable_cash / price))
-    final_quantity = min(original_quantity, max_affordable_quantity)
+
+    # V2.2 FIX:
+    # In dynamic sizing mode, Portfolio Manager must calculate the order size
+    # from usable cash. If TradingView does not send quantity, safe_int() used
+    # to default original_quantity to 1, which caused small orders like PCG
+    # to be blocked by MIN_TRADE_VALUE even when cash could buy more shares.
+    #
+    # Behavior:
+    # - If TradingView sends an explicit positive quantity, respect it as an upper cap.
+    # - If no quantity is sent, use the maximum affordable dynamic quantity.
+    raw_quantity = data.get("quantity")
+    has_explicit_quantity = raw_quantity not in [None, "", "None"]
+
+    if has_explicit_quantity:
+        final_quantity = min(original_quantity, max_affordable_quantity)
+        sizing_quantity_mode = "dynamic_capped_by_tradingview_quantity"
+    else:
+        final_quantity = max_affordable_quantity
+        sizing_quantity_mode = "dynamic_cash_based_quantity"
+
     trade_value = final_quantity * price
 
     if final_quantity < 1:
@@ -367,6 +386,8 @@ def calculate_dynamic_quantity(data, positions):
             "usable_cash": round(usable_cash, 2),
             "price_used": price,
             "original_quantity": original_quantity,
+            "has_explicit_quantity": has_explicit_quantity,
+            "quantity_mode": sizing_quantity_mode,
             "max_affordable_quantity": max_affordable_quantity
         }
 
@@ -381,6 +402,10 @@ def calculate_dynamic_quantity(data, positions):
             "usable_cash": round(usable_cash, 2),
             "price_used": price,
             "quantity": final_quantity,
+            "original_quantity": original_quantity,
+            "has_explicit_quantity": has_explicit_quantity,
+            "quantity_mode": sizing_quantity_mode,
+            "max_affordable_quantity": max_affordable_quantity,
             "trade_value": round(trade_value, 2),
             "min_trade_value": MIN_TRADE_VALUE
         }
@@ -397,6 +422,8 @@ def calculate_dynamic_quantity(data, positions):
         "remaining_slots": remaining_slots,
         "price_used": price,
         "original_quantity": original_quantity,
+        "has_explicit_quantity": has_explicit_quantity,
+        "quantity_mode": sizing_quantity_mode,
         "max_affordable_quantity": max_affordable_quantity,
         "final_quantity": final_quantity,
         "estimated_trade_value": round(trade_value, 2)
