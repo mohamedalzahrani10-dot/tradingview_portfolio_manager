@@ -20,6 +20,13 @@ PARTIAL_SELL_MIN_FULL_EXIT_QTY = int(os.getenv("PARTIAL_SELL_MIN_FULL_EXIT_QTY",
 PARTIAL_TAKE_PROFIT_PERCENT = float(os.getenv("PARTIAL_TAKE_PROFIT_PERCENT", "0.30"))
 SCALE_OUT_PERCENT = float(os.getenv("SCALE_OUT_PERCENT", "0.20"))
 
+# V2.4 Auto Exit Manager
+AUTO_EXIT_MANAGER_ENABLED = os.getenv("AUTO_EXIT_MANAGER_ENABLED", "true").lower() == "true"
+AUTO_EXIT_FULL_ON_STOP_LOSS = os.getenv("AUTO_EXIT_FULL_ON_STOP_LOSS", "true").lower() == "true"
+AUTO_EXIT_FULL_ON_TAKE_PROFIT = os.getenv("AUTO_EXIT_FULL_ON_TAKE_PROFIT", "true").lower() == "true"
+DEFAULT_STOP_LOSS_PERCENT = float(os.getenv("DEFAULT_STOP_LOSS_PERCENT", "0") or 0)
+DEFAULT_TAKE_PROFIT_PERCENT = float(os.getenv("DEFAULT_TAKE_PROFIT_PERCENT", "0") or 0)
+
 # =========================================================
 # PORTFOLIO MANAGER V2.1
 # Dynamic Sizing + Session Risk Manager
@@ -230,6 +237,27 @@ def get_take_profit_price(data):
     return safe_float(data.get("takeProfitPrice"), 0)
 
 
+def get_stop_loss_price(data):
+    extras = get_extras(data)
+    sl = safe_float(extras.get("stopLossPrice"), 0)
+    if sl > 0:
+        return sl
+    return safe_float(data.get("stopLossPrice"), 0)
+
+
+def derive_default_exit_prices(entry_price):
+    stop_loss = 0.0
+    take_profit = 0.0
+
+    if entry_price > 0 and DEFAULT_STOP_LOSS_PERCENT > 0:
+        stop_loss = entry_price * (1 - DEFAULT_STOP_LOSS_PERCENT)
+
+    if entry_price > 0 and DEFAULT_TAKE_PROFIT_PERCENT > 0:
+        take_profit = entry_price * (1 + DEFAULT_TAKE_PROFIT_PERCENT)
+
+    return round(stop_loss, 4), round(take_profit, 4)
+
+
 def estimate_round_trip_fee(quantity):
     qty = max(safe_float(quantity, 0), 0)
     one_way = max(qty * IBKR_FEE_PER_SHARE, IBKR_MIN_FEE_PER_ORDER)
@@ -323,10 +351,10 @@ def get_available_cash_after_reserved(positions, state=None):
     return remaining, reserved
 
 
-def calculate_dynamic_quantity(data, positions):
+def calculate_dynamic_quantity(data, positions, state=None):
     original_quantity = safe_int(data.get("quantity", 1), 1)
     price = get_trade_price(data)
-    effective_available_cash = get_effective_available_cash()
+    effective_available_cash = get_effective_available_cash(state)
 
     if not USE_DYNAMIC_POSITION_SIZING:
         return original_quantity, {
@@ -704,6 +732,107 @@ def session_risk_worker():
         time.sleep(SESSION_CHECK_INTERVAL_SECONDS)
 
 
+def get_price_update_value(data):
+    for key in ["current_price", "currentPrice", "lastPrice", "price", "close", "signalPrice", "limitPrice"]:
+        price = safe_float(data.get(key), 0)
+        if price > 0:
+            return price
+    return 0
+
+
+def evaluate_auto_exit_for_ticker(ticker, current_price, reason_source="price_update"):
+    if not AUTO_EXIT_MANAGER_ENABLED:
+        return {"ok": True, "decision": "auto_exit_disabled", "ticker": ticker}
+
+    state = load_state()
+    positions = state.get("positions", {})
+    position = positions.get(ticker)
+
+    if not position:
+        return {"ok": True, "decision": "no_local_position", "ticker": ticker, "current_price": current_price}
+
+    qty = safe_int(position.get("quantity", 0), 0)
+    if qty <= 0:
+        return {"ok": True, "decision": "invalid_local_quantity", "ticker": ticker, "quantity": qty}
+
+    entry_price = safe_float(position.get("entry_price") or position.get("entry_signal_price"), 0)
+    stop_loss = safe_float(position.get("stop_loss_price"), 0)
+    take_profit = safe_float(position.get("take_profit_price"), 0)
+
+    # Fallback optional percentage exits if no explicit SL/TP exists.
+    default_sl, default_tp = derive_default_exit_prices(entry_price)
+    if stop_loss <= 0:
+        stop_loss = default_sl
+    if take_profit <= 0:
+        take_profit = default_tp
+
+    trigger_reason = None
+    exit_mode = None
+
+    if stop_loss > 0 and current_price <= stop_loss:
+        trigger_reason = "stop_loss"
+        exit_mode = "full_exit" if AUTO_EXIT_FULL_ON_STOP_LOSS else "partial_take_profit"
+    elif take_profit > 0 and current_price >= take_profit:
+        trigger_reason = "take_profit"
+        exit_mode = "full_exit" if AUTO_EXIT_FULL_ON_TAKE_PROFIT else "partial_take_profit"
+
+    if not trigger_reason:
+        return {
+            "ok": True,
+            "decision": "hold",
+            "ticker": ticker,
+            "current_price": current_price,
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss,
+            "take_profit_price": take_profit,
+            "quantity": qty
+        }
+
+    if exit_mode == "full_exit":
+        exit_quantity = qty
+        exit_calc = {"reason": trigger_reason, "mode": "auto_full_exit", "source_qty": qty}
+    else:
+        exit_quantity, exit_calc = calculate_exit_quantity(position, qty, "partial_take_profit")
+        exit_calc["auto_trigger_reason"] = trigger_reason
+
+    if exit_quantity <= 0:
+        return {"ok": True, "decision": "auto_exit_zero_quantity", "ticker": ticker, "exit_calc": exit_calc}
+
+    payload = build_sell_payload(ticker, exit_quantity)
+    ok = send_to_traderspost(payload)
+
+    if ok:
+        positions, remaining_qty = update_position_after_sell(positions, ticker, exit_quantity)
+        state["positions"] = positions
+        add_history(state, "AUTO_EXIT_SENT", {
+            "ticker": ticker,
+            "quantity": exit_quantity,
+            "remaining_quantity": remaining_qty,
+            "reason": trigger_reason,
+            "source": reason_source,
+            "current_price": current_price,
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss,
+            "take_profit_price": take_profit,
+            "exit_calc": exit_calc
+        })
+        save_state(state)
+        print(f"AUTO EXIT SENT: {ticker} reason={trigger_reason} sold={exit_quantity} price={current_price}", flush=True)
+
+    return {
+        "ok": ok,
+        "decision": "auto_exit_sent" if ok else "auto_exit_failed",
+        "ticker": ticker,
+        "reason": trigger_reason,
+        "quantity": exit_quantity,
+        "current_price": current_price,
+        "entry_price": entry_price,
+        "stop_loss_price": stop_loss,
+        "take_profit_price": take_profit,
+        "exit_calc": exit_calc
+    }
+
+
 def start_scanner_background():
     try:
         from scanner import run_scanner
@@ -727,7 +856,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "Portfolio Manager Running ✅",
-        "version": "V2.3 Internal Cash Sync + Partial Exits",
+        "version": "V2.4 Auto SL/TP + Internal Cash Sync",
         "session": get_session_info(),
         "max_positions": MAX_POSITIONS,
         "dynamic_position_sizing": USE_DYNAMIC_POSITION_SIZING,
@@ -752,11 +881,21 @@ def webhook():
     order_type = str(data.get("orderType", "market")).lower()
     signal_price = data.get("signalPrice") or data.get("price") or data.get("close")
 
-    if not ticker or action not in ["buy", "sell", "exit"]:
+    if not ticker or action not in ["buy", "sell", "exit", "price_update", "monitor"]:
         return jsonify({"ok": False, "error": "Invalid signal", "data": data}), 400
 
     state = load_state()
     positions = state.get("positions", {})
+
+    # PRICE UPDATE / MONITOR:
+    # TradingView can send current price updates so Portfolio Manager can trigger
+    # auto stop-loss or take-profit exits without a separate sell alert.
+    if action in ["price_update", "monitor"]:
+        current_price = get_price_update_value(data)
+        if current_price <= 0:
+            return jsonify({"ok": False, "error": "Missing valid current price", "data": data}), 400
+        result = evaluate_auto_exit_for_ticker(ticker, current_price, reason_source=action)
+        return jsonify(result)
 
     # SELL / EXIT:
     # إذا المركز محفوظ نخرج/نخفف حسب كمية Railway الحقيقية.
@@ -869,7 +1008,7 @@ def webhook():
             "score": score
         })
 
-    final_quantity, sizing_info = calculate_dynamic_quantity(data, positions)
+    final_quantity, sizing_info = calculate_dynamic_quantity(data, positions, state)
 
     if final_quantity < 1:
         print("BUY BLOCKED BY POSITION SIZING:", json.dumps(sizing_info, ensure_ascii=False), flush=True)
@@ -907,6 +1046,7 @@ def webhook():
                 "quantity": final_quantity,
                 "entry_signal_price": signal_price,
                 "entry_price": get_trade_price(data),
+                "stop_loss_price": get_stop_loss_price(data),
                 "take_profit_price": get_take_profit_price(data),
                 "order_type": order_type,
                 "limit_price": data.get("limitPrice"),
@@ -968,7 +1108,7 @@ def webhook():
         state["positions"] = positions
         save_state(state)
 
-        final_quantity, sizing_info = calculate_dynamic_quantity(data, positions)
+        final_quantity, sizing_info = calculate_dynamic_quantity(data, positions, state)
         if final_quantity < 1:
             return jsonify({
                 "ok": True,
@@ -999,6 +1139,7 @@ def webhook():
                 "quantity": final_quantity,
                 "entry_signal_price": signal_price,
                 "entry_price": get_trade_price(data),
+                "stop_loss_price": get_stop_loss_price(data),
                 "take_profit_price": get_take_profit_price(data),
                 "order_type": order_type,
                 "limit_price": data.get("limitPrice"),
@@ -1100,7 +1241,8 @@ def manual_position():
         "quantity": quantity,
         "entry_signal_price": entry_price,
         "entry_price": entry_price,
-        "take_profit_price": safe_float(data.get("takeProfitPrice"), 0),
+        "stop_loss_price": safe_float(data.get("stopLossPrice") or data.get("stop_loss_price"), 0),
+        "take_profit_price": safe_float(data.get("takeProfitPrice") or data.get("take_profit_price"), 0),
         "order_type": "manual_sync",
         "limit_price": entry_price,
         "session": get_session_info()["session"],
@@ -1244,6 +1386,30 @@ def cash_status():
     })
 
 
+@app.route("/price_update", methods=["POST"])
+def price_update():
+    """
+    Manual/test endpoint for Auto Stop Loss / Take Profit.
+
+    PowerShell example:
+    $body = @{ ticker = "PCG"; current_price = 18.50 } | ConvertTo-Json
+    Invoke-RestMethod `
+     -Uri "https://.../price_update" `
+     -Method Post `
+     -ContentType "application/json" `
+     -Body $body
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    ticker = str(data.get("ticker", "")).upper().strip()
+    current_price = get_price_update_value(data)
+
+    if not ticker or current_price <= 0:
+        return jsonify({"ok": False, "error": "ticker and valid current_price are required", "data": data}), 400
+
+    result = evaluate_auto_exit_for_ticker(ticker, current_price, reason_source="price_update_endpoint")
+    return jsonify(result)
+
+
 @app.route("/settings", methods=["GET"])
 def settings():
     state = load_state()
@@ -1251,7 +1417,7 @@ def settings():
     available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions, state)
 
     return jsonify({
-        "VERSION": "V2.3 Internal Cash Sync + Partial Exits",
+        "VERSION": "V2.4 Auto SL/TP + Internal Cash Sync",
         "MAX_POSITIONS": MAX_POSITIONS,
         "AVAILABLE_CASH": get_effective_available_cash(state),
         "ENV_AVAILABLE_CASH": AVAILABLE_CASH,
@@ -1282,6 +1448,11 @@ def settings():
         "PARTIAL_SELL_MIN_FULL_EXIT_QTY": PARTIAL_SELL_MIN_FULL_EXIT_QTY,
         "PARTIAL_TAKE_PROFIT_PERCENT": PARTIAL_TAKE_PROFIT_PERCENT,
         "SCALE_OUT_PERCENT": SCALE_OUT_PERCENT,
+        "AUTO_EXIT_MANAGER_ENABLED": AUTO_EXIT_MANAGER_ENABLED,
+        "AUTO_EXIT_FULL_ON_STOP_LOSS": AUTO_EXIT_FULL_ON_STOP_LOSS,
+        "AUTO_EXIT_FULL_ON_TAKE_PROFIT": AUTO_EXIT_FULL_ON_TAKE_PROFIT,
+        "DEFAULT_STOP_LOSS_PERCENT": DEFAULT_STOP_LOSS_PERCENT,
+        "DEFAULT_TAKE_PROFIT_PERCENT": DEFAULT_TAKE_PROFIT_PERCENT,
         "STATE_FILE": STATE_FILE,
         "STATE_FILE_EXISTS": os.path.exists(STATE_FILE),
         "WORKING_DIRECTORY": os.getcwd(),
