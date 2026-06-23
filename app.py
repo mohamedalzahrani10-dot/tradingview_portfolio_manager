@@ -753,6 +753,7 @@ def webhook():
                 "exit_calc": exit_calc
             })
             state["positions"] = positions
+            print(f"POSITION REMOVED/UPDATED: {ticker} sold={exit_quantity}", flush=True)
             save_state(state)
 
         return jsonify({
@@ -874,6 +875,7 @@ def webhook():
                 "fee_guard": fee_info,
                 "session_meta": session_meta
             })
+            print(f"POSITION SAVED: {ticker} qty={final_quantity}", flush=True)
             save_state(state)
 
         return jsonify({
