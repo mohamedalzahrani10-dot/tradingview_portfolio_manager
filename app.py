@@ -884,7 +884,7 @@ def home():
     return jsonify({
         "ok": True,
         "service": "Portfolio Manager Running ✅",
-        "version": "V2.6 Pending Orders + Cash-Only Sizing",
+        "version": "V2.7 Pending Until Fill Confirmed",
         "session": get_session_info(),
         "max_positions": MAX_POSITIONS,
         "dynamic_position_sizing": USE_DYNAMIC_POSITION_SIZING,
@@ -1129,37 +1129,32 @@ def webhook():
                 "last_signal": data
             }
 
+            # Production safety:
+            # Any submitted BUY order (market or limit) is NOT treated as a filled position.
+            # IBKR may keep market orders in PreSubmitted / Submitted status, especially
+            # outside regular trading hours. Keep all BUY orders in pending_orders until
+            # the fill is confirmed manually via /mark_filled or a future broker callback.
+            pending_orders[ticker] = order_record
+            state["pending_orders"] = pending_orders
+
             if order_type == "limit":
-                # Critical V2.6 fix:
-                # A submitted limit order is NOT a filled position. Keep it as pending
-                # so Railway does not assume ownership of shares before IBKR fills them.
-                pending_orders[ticker] = order_record
-                state["pending_orders"] = pending_orders
-                add_history(state, "BUY_ORDER_SUBMITTED_PENDING", {
-                    "ticker": ticker,
-                    "quantity": final_quantity,
-                    "score": score,
-                    "sizing": sizing_info,
-                    "fee_guard": fee_info,
-                    "session_meta": session_meta
-                })
-                print(f"PENDING ORDER SAVED: {ticker} qty={final_quantity}", flush=True)
-                decision = "buy_order_submitted_pending"
+                history_event = "BUY_LIMIT_ORDER_SUBMITTED_PENDING"
+                decision = "buy_limit_order_submitted_pending"
+                print(f"PENDING LIMIT ORDER SAVED: {ticker} qty={final_quantity}", flush=True)
             else:
-                # Market orders are treated as positions after successful submission.
-                # For stricter production, connect a broker fill callback in a later version.
-                positions[ticker] = order_record
-                state["positions"] = positions
-                add_history(state, "BUY_SENT", {
-                    "ticker": ticker,
-                    "quantity": final_quantity,
-                    "score": score,
-                    "sizing": sizing_info,
-                    "fee_guard": fee_info,
-                    "session_meta": session_meta
-                })
-                print(f"POSITION SAVED: {ticker} qty={final_quantity}", flush=True)
-                decision = "buy_sent"
+                history_event = "BUY_MARKET_ORDER_SUBMITTED_PENDING"
+                decision = "buy_market_order_submitted_pending"
+                print(f"PENDING MARKET ORDER SAVED: {ticker} qty={final_quantity}", flush=True)
+
+            add_history(state, history_event, {
+                "ticker": ticker,
+                "quantity": final_quantity,
+                "score": score,
+                "sizing": sizing_info,
+                "fee_guard": fee_info,
+                "session_meta": session_meta,
+                "order_type": order_type
+            })
 
             save_state(state)
         else:
@@ -1240,7 +1235,11 @@ def webhook():
         buy_ok = send_to_traderspost(buy_payload)
 
         if buy_ok:
-            positions[ticker] = {
+            # Production safety:
+            # After a swap sell, the new BUY is still only a submitted order.
+            # Keep it pending until the fill is confirmed via /mark_filled.
+            pending_orders = state.setdefault("pending_orders", {})
+            pending_orders[ticker] = {
                 "score": score,
                 "alpha_score": safe_float(data.get("alphaScore"), 0),
                 "quantity": final_quantity,
@@ -1257,15 +1256,16 @@ def webhook():
                 "created_at": time.time(),
                 "last_signal": data
             }
-            state["positions"] = positions
-            add_history(state, "SWAP", {
+            state["pending_orders"] = pending_orders
+            add_history(state, "SWAP_SELL_DONE_BUY_SUBMITTED_PENDING", {
                 "sold": weakest_ticker,
                 "sold_score": weakest_score,
                 "sold_quantity": weakest_quantity,
                 "bought": ticker,
                 "bought_score": score,
                 "bought_quantity": final_quantity,
-                "fee_guard": fee_info
+                "fee_guard": fee_info,
+                "order_type": order_type
             })
             save_state(state)
 
@@ -1604,7 +1604,7 @@ def settings():
     available_after_reserved, reserved_cash = get_available_cash_after_reserved(positions, state)
 
     return jsonify({
-        "VERSION": "V2.6 Pending Orders + Cash-Only Sizing",
+        "VERSION": "V2.7 Pending Until Fill Confirmed",
         "MAX_POSITIONS": MAX_POSITIONS,
         "AVAILABLE_CASH": get_effective_available_cash(state),
         "ENV_AVAILABLE_CASH": AVAILABLE_CASH,
