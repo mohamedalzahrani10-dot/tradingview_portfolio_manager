@@ -909,6 +909,13 @@ def webhook():
     order_type = str(data.get("orderType", "market")).lower()
     signal_price = data.get("signalPrice") or data.get("price") or data.get("close")
 
+    if not data:
+        return jsonify({
+            "ok": True,
+            "decision": "ignored_empty_webhook",
+            "reason": "Empty webhook payload received"
+        }), 200
+
     if not ticker or action not in ["buy", "sell", "exit", "price_update", "monitor"]:
         return jsonify({"ok": False, "error": "Invalid signal", "data": data}), 400
 
@@ -921,7 +928,8 @@ def webhook():
         })
 
     state = load_state()
-    positions = state.get("positions", {})
+    positions = state.setdefault("positions", {})
+    pending_orders = state.setdefault("pending_orders", {})
 
     # PRICE UPDATE / MONITOR:
     # TradingView can send current price updates so Portfolio Manager can trigger
