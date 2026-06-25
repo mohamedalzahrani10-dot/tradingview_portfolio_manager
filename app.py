@@ -12,9 +12,9 @@ app = Flask(__name__)
 
 TRADERSPOST_WEBHOOK = os.getenv("TRADERSPOST_WEBHOOK", "")
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
-STATE_FILE = os.getenv("STATE_FILE", "portfolio_state.json")
-# إذا كنت تستخدم Railway Volume اجعلها مثلاً:
-# STATE_FILE=/data/portfolio_state.json
+STATE_FILE = os.getenv("STATE_FILE", "/data/portfolio_state.json")
+# Railway Volume persistent storage path.
+# Keep STATE_FILE=/data/portfolio_state.json in Railway Variables.
 ALLOW_ORPHAN_EXIT_WITH_SIGNAL_QUANTITY = os.getenv("ALLOW_ORPHAN_EXIT_WITH_SIGNAL_QUANTITY", "true").lower() == "true"
 PARTIAL_SELL_MIN_FULL_EXIT_QTY = int(os.getenv("PARTIAL_SELL_MIN_FULL_EXIT_QTY", "4"))
 PARTIAL_TAKE_PROFIT_PERCENT = float(os.getenv("PARTIAL_TAKE_PROFIT_PERCENT", "0.30"))
@@ -175,20 +175,35 @@ def get_session_info():
     }
 
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {"positions": {}, "pending_orders": {}, "closed_sessions": {}, "history": []}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-    except Exception:
-        state = {}
+def default_state():
+    return {"positions": {}, "pending_orders": {}, "closed_sessions": {}, "history": []}
 
+
+def normalize_state(state):
+    if not isinstance(state, dict):
+        state = {}
     state.setdefault("positions", {})
     state.setdefault("pending_orders", {})
     state.setdefault("closed_sessions", {})
     state.setdefault("history", [])
     return state
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        state = default_state()
+        save_state(state)
+        return state
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception as e:
+        print(f"STATE LOAD ERROR: {STATE_FILE} | {e}", flush=True)
+        state = default_state()
+        save_state(state)
+
+    return normalize_state(state)
 
 
 def save_state(state):
@@ -861,6 +876,15 @@ def evaluate_auto_exit_for_ticker(ticker, current_price, reason_source="price_up
     }
 
 
+def initialize_state_file():
+    try:
+        state = load_state()
+        save_state(state)
+        print(f"STATE FILE ACTIVE: {STATE_FILE} | exists={os.path.exists(STATE_FILE)}", flush=True)
+    except Exception as e:
+        print(f"STATE FILE INIT ERROR: {STATE_FILE} | {e}", flush=True)
+
+
 def start_scanner_background():
     try:
         from scanner import run_scanner
@@ -892,7 +916,9 @@ def home():
         "available_cash_setting": AVAILABLE_CASH,
         "effective_available_cash": get_effective_available_cash(),
         "cash_usage_percent": CASH_USAGE_PERCENT,
-        "safety_buffer_percent": SAFETY_BUFFER_PERCENT
+        "safety_buffer_percent": SAFETY_BUFFER_PERCENT,
+        "state_file": STATE_FILE,
+        "state_file_exists": os.path.exists(STATE_FILE)
     })
 
 
@@ -1651,6 +1677,7 @@ def settings():
     })
 
 
+initialize_state_file()
 start_scanner_background()
 start_session_risk_background()
 
